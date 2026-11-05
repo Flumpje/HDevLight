@@ -1,5 +1,6 @@
-"""Code editor widget with line-number gutter, light theme, auto-indent,
-autocomplete, Ctrl-scroll zoom, and Activate/Deactivate lines."""
+"""Code editor widget — line-number gutter, syntax, autocomplete, zoom."""
+
+import re
 
 from PyQt6.QtCore import Qt, QRect, QSize, QStringListModel
 from PyQt6.QtGui import (
@@ -7,7 +8,7 @@ from PyQt6.QtGui import (
     QTextCursor, QTextFormat,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QCompleter, QPlainTextEdit, QTextEdit, QWidget,
+    QApplication, QCompleter, QPlainTextEdit, QTextEdit, QToolTip, QWidget,
 )
 
 _GUTTER_BG = QColor("#F0F0F0")
@@ -19,19 +20,47 @@ _EDITOR_FG = QColor("#000000")
 _MIN_FONT_SIZE = 6
 _MAX_FONT_SIZE = 48
 
+# Module-level singletons — built once per session
+_WORD_LIST: list[str] | None = None
+_SIGNATURES = None  # lazy Signatures singleton
+
+_OP_RE  = re.compile(r'\b([a-z][a-z0-9_]*)$')   # operator name before (
+_VAR_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=')  # assignment target
+
+
+def _get_signatures():
+    global _SIGNATURES
+    if _SIGNATURES is None:
+        try:
+            from .hdev_core import Signatures, halcon_root
+            _SIGNATURES = Signatures(halcon_root())
+        except Exception:
+            pass
+    return _SIGNATURES
+
 
 def _build_word_list() -> list[str]:
-    """Return sorted list of HALCON keywords + cached operator names."""
+    """Keywords + all HALCON operator names from the installed docs."""
+    global _WORD_LIST
+    if _WORD_LIST is not None:
+        return _WORD_LIST
     from .highlighter import KEYWORDS as KW
     words: set[str] = set(KW)
     try:
-        from .hdev_core import Signatures, halcon_root
-        sigs = Signatures(halcon_root())
-        words.update(k for k in sigs.cache if k and k[0].islower())
+        from .hdev_core import halcon_root
+        root = halcon_root()
+        if root:
+            op_dir = root / 'doc/html/reference/operators'
+            if op_dir.is_dir():
+                # Just the file stems — no file reads needed
+                words.update(p.stem for p in op_dir.glob('*.html'))
     except Exception:
         pass
-    return sorted(words)
+    _WORD_LIST = sorted(words)
+    return _WORD_LIST
 
+
+# ---------------------------------------------------------------------------
 
 class _LineNumberArea(QWidget):
     def __init__(self, editor: "CodeEditor") -> None:
@@ -60,11 +89,16 @@ class CodeEditor(QPlainTextEdit):
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
         self.cursorPositionChanged.connect(self._highlight_current_line)
+        self.cursorPositionChanged.connect(self._on_cursor_for_hint)
 
         self._update_gutter_width(0)
         self._highlight_current_line()
 
         self._completer: QCompleter | None = None
+        self._completer_model: QStringListModel | None = None
+        self._last_vars: set[str] = set()
+        self._hint_line: int = -1
+
         self._init_completer()
 
     # ------------------------------------------------------------------
@@ -141,10 +175,10 @@ class CodeEditor(QPlainTextEdit):
         self.setExtraSelections(selections)
 
     # ------------------------------------------------------------------
-    # Keyboard handling (auto-indent + completer integration)
+    # Keyboard handling
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
-        # Let completer consume navigation/confirm keys when popup is visible
+        # Let completer consume navigation keys when popup is visible
         if self._completer and self._completer.popup().isVisible():
             if event.key() in (
                 Qt.Key.Key_Enter, Qt.Key.Key_Return,
@@ -166,10 +200,19 @@ class CodeEditor(QPlainTextEdit):
 
         super().keyPressEvent(event)
 
+        ch = event.text()
+
+        # Parameter hint on (
+        if ch == '(':
+            self._try_show_param_hint()
+
+        # Update / hide completer
         if self._completer:
             ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            if ctrl or event.key() == Qt.Key.Key_Escape or not event.text():
+            if ctrl or event.key() == Qt.Key.Key_Escape or not ch:
                 self._completer.popup().hide()
+                if event.key() == Qt.Key.Key_Escape:
+                    QToolTip.hideText()
             else:
                 self._update_completer()
 
@@ -180,11 +223,21 @@ class CodeEditor(QPlainTextEdit):
         words = _build_word_list()
         if not words:
             return
-        self._completer = QCompleter(QStringListModel(words, self), self)
+        self._completer_model = QStringListModel(words, self)
+        self._completer = QCompleter(self._completer_model, self)
         self._completer.setWidget(self)
         self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseSensitive)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._completer.activated.connect(self._insert_completion)
+
+    def _extract_variables(self) -> list[str]:
+        """Scan this editor for variable names on the left of :=."""
+        vars_: set[str] = set()
+        for line in self.toPlainText().split('\n'):
+            m = _VAR_RE.match(line)
+            if m:
+                vars_.add(m.group(1))
+        return sorted(vars_)
 
     def _word_under_cursor(self) -> str:
         tc = self.textCursor()
@@ -192,11 +245,20 @@ class CodeEditor(QPlainTextEdit):
         return tc.selectedText()
 
     def _update_completer(self) -> None:
-        if not self._completer:
+        if not self._completer or not self._completer_model:
             return
+
+        tc = self.textCursor()
+        line_text = tc.block().text()
+        col = tc.columnNumber()
+
         # Don't complete inside comment lines
-        line_text = self.textCursor().block().text()
         if line_text.lstrip().startswith("*"):
+            self._completer.popup().hide()
+            return
+
+        # Don't complete inside string literals
+        if line_text[:col].count("'") % 2 == 1:
             self._completer.popup().hide()
             return
 
@@ -204,6 +266,14 @@ class CodeEditor(QPlainTextEdit):
         if len(prefix) < 2 or not prefix[0].isalpha():
             self._completer.popup().hide()
             return
+
+        # Merge static words + current document variables (only rebuild when changed)
+        vars_ = set(self._extract_variables())
+        if vars_ != self._last_vars:
+            self._last_vars = vars_
+            base = _build_word_list()
+            merged = sorted(set(base) | vars_)
+            self._completer_model.setStringList(merged)
 
         if prefix != self._completer.completionPrefix():
             self._completer.setCompletionPrefix(prefix)
@@ -231,6 +301,50 @@ class CodeEditor(QPlainTextEdit):
         self.setTextCursor(tc)
 
     # ------------------------------------------------------------------
+    # Parameter hints
+
+    def _try_show_param_hint(self) -> None:
+        sigs = _get_signatures()
+        if not sigs:
+            return
+        tc = self.textCursor()
+        # Text before the ( on this line
+        before = tc.block().text()[:tc.columnNumber() - 1].rstrip()
+        m = _OP_RE.search(before)
+        if not m:
+            return
+        name = m.group(1)
+        groups = sigs.get(name)
+        sigs.save()
+        if not groups or all(not g for g in groups):
+            return
+
+        def _fmt(lst: list[str]) -> str:
+            if not lst:
+                return "—"
+            if len(lst) > 6:
+                return ", ".join(lst[:6]) + ", …"
+            return ", ".join(lst)
+
+        lines = [
+            f"  in  iconic : {_fmt(groups[0])}",
+            f"  out iconic : {_fmt(groups[1])}",
+            f"  in  ctrl   : {_fmt(groups[2])}",
+            f"  out ctrl   : {_fmt(groups[3])}",
+        ]
+        hint = f"{name}(\n" + "\n".join(lines) + "\n)"
+        cr = self.cursorRect()
+        pos = self.viewport().mapToGlobal(cr.bottomLeft())
+        QToolTip.showText(pos, hint, self)
+        self._hint_line = tc.blockNumber()
+
+    def _on_cursor_for_hint(self) -> None:
+        if self._hint_line >= 0:
+            if self.textCursor().blockNumber() != self._hint_line:
+                QToolTip.hideText()
+                self._hint_line = -1
+
+    # ------------------------------------------------------------------
     # Ctrl+scroll font zoom
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
@@ -250,19 +364,19 @@ class CodeEditor(QPlainTextEdit):
             self.setFont(font)
 
     # ------------------------------------------------------------------
-    # Context menu (adds Activate / Deactivate Lines)
+    # Context menu
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[override]
         menu = self.createStandardContextMenu()
         menu.addSeparator()
-        act_act = menu.addAction("Activate Lines\tF3")
-        act_deact = menu.addAction("Deactivate Lines\tF4")
-        act_act.triggered.connect(lambda: self.toggle_comment_lines(activate=True))
-        act_deact.triggered.connect(lambda: self.toggle_comment_lines(activate=False))
+        menu.addAction("Activate Lines\tF3",
+                       lambda: self.toggle_comment_lines(activate=True))
+        menu.addAction("Deactivate Lines\tF4",
+                       lambda: self.toggle_comment_lines(activate=False))
         menu.exec(event.globalPos())
 
     # ------------------------------------------------------------------
-    # Activate / Deactivate (remove / add leading *)
+    # Activate / Deactivate lines
 
     def toggle_comment_lines(self, activate: bool) -> None:
         """Remove (*) leading star to activate lines, or add it to deactivate."""
@@ -272,7 +386,6 @@ class CodeEditor(QPlainTextEdit):
 
         doc = self.document()
         b_start = doc.findBlock(start)
-        # If selection ends exactly at block start (nothing selected on last line), back up
         b_end_pos = end if end == start else end - 1
         b_end = doc.findBlock(b_end_pos)
 
