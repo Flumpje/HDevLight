@@ -9,8 +9,7 @@ from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QAction, QFont, QKeySequence
 from PyQt6.QtWidgets import (
     QDockWidget, QFileDialog, QFrame, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QSizePolicy, QStatusBar, QTabWidget,
-    QToolBar, QWidget,
+    QMainWindow, QMessageBox, QStatusBar, QTabWidget, QWidget,
 )
 
 from .checker_panel import CheckerPanel
@@ -56,6 +55,7 @@ class MainWindow(QMainWindow):
 
         self.outline = OutlinePanel()
         self.outline.procedure_clicked.connect(self._goto_procedure)
+        self.outline.add_procedure_requested.connect(self._add_procedure)
         dock_left = QDockWidget("Procedures", self)
         dock_left.setWidget(self.outline)
         dock_left.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea)
@@ -137,54 +137,7 @@ class MainWindow(QMainWindow):
         act_check.setEnabled(True)
 
     def _build_toolbar(self) -> None:
-        tb = QToolBar("Main")
-        tb.setMovable(False)
-        tb.setStyleSheet("""
-            QToolBar {
-                background: #E87722;
-                border: none;
-                spacing: 4px;
-                padding: 2px 6px;
-            }
-            QToolBar::separator {
-                background: rgba(255,255,255,0.5);
-                width: 1px;
-                margin: 5px 3px;
-            }
-            QToolButton {
-                color: white;
-                background: transparent;
-                border: 1px solid rgba(255,255,255,0.55);
-                padding: 4px 14px;
-                border-radius: 3px;
-                font-weight: bold;
-                min-width: 48px;
-            }
-            QToolButton:hover {
-                background: rgba(255,255,255,0.22);
-                border: 1px solid white;
-            }
-            QToolButton:pressed {
-                background: rgba(0,0,0,0.14);
-                border: 1px solid rgba(255,255,255,0.8);
-            }
-        """)
-        self.addToolBar(tb)
-
-        # Spacer pushes all buttons to the right
-        spacer = QWidget()
-        spacer.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
-        )
-        spacer.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        tb.addWidget(spacer)
-
-        tb.addAction("Open", self.open_dialog)
-        tb.addAction("Save", self.save)
-        tb.addSeparator()
-        tb.addAction("Run Check  F5", self._run_checker)
-        tb.addSeparator()
-        tb.addAction("Find  Ctrl+F", self._show_find_replace)
+        pass
 
     @staticmethod
     def _add_action(menu, label: str, shortcut, slot) -> QAction:
@@ -398,6 +351,44 @@ class MainWindow(QMainWindow):
         keys = list(self.editors.keys())
         if proc_name in keys:
             self.tabs.setCurrentIndex(keys.index(proc_name))
+
+    def _add_procedure(self) -> None:
+        if not self.document:
+            QMessageBox.warning(self, "No File", "Open a file first.")
+            return
+        name, ok = QInputDialog.getText(self, "New Procedure", "Procedure name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if name in self.editors:
+            QMessageBox.warning(self, "Duplicate", f"'{name}' already exists.")
+            return
+        if not name.isidentifier():
+            QMessageBox.warning(
+                self, "Invalid Name",
+                "Name must start with a letter and contain only letters, digits and underscores."
+            )
+            return
+
+        self.document.add_procedure(name)
+
+        editor = CodeEditor()
+        editor.setFont(_EDITOR_FONT)
+        editor._hl = HalconHighlighter(editor.document())
+        editor.setPlainText("")
+        editor.document().modificationChanged.connect(
+            lambda mod, pn=name: self._on_modified(pn, mod)
+        )
+        editor.cursorPositionChanged.connect(self._update_cursor_position)
+        self.editors[name] = editor
+        self.tabs.addTab(editor, name)
+        editor.document().setModified(True)
+
+        self.outline.set_procedures(self.document.procedures)
+        self._goto_procedure(name)
+        self.act_save.setEnabled(True)
 
     def _on_tab_changed(self, _index: int) -> None:
         self._update_cursor_position()

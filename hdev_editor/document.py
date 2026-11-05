@@ -24,10 +24,29 @@ class HdevDocument:
         }
 
     def procedure_text(self, proc_name: str) -> str:
+        # Prefer in-memory edits so rebuilt tabs keep unsaved content
+        if proc_name in self._edits:
+            return "\n".join(line for _, line in self._edits[proc_name])
         for p in self.procedures:
             if p.name == proc_name:
                 return "\n".join(r.text for r in p.rows)
         return ""
+
+    def add_procedure(self, name: str) -> None:
+        """Append a new empty procedure and update the in-memory model."""
+        new_xml = (
+            f'\n<procedure name="{name}">\n'
+            '<interface>\n<io>\n</io>\n<oo>\n</oo>\n<ic>\n</ic>\n<oc>\n</oc>\n</interface>\n'
+            '<body>\n<l></l>\n</body>\n'
+            '<docu id="used">\n<short lang="en_US"></short>\n</docu>\n'
+            '</procedure>\n'
+        )
+        self._orig_xml = self._orig_xml.replace('</hdevelop>', new_xml + '</hdevelop>')
+
+        proc = Procedure(name, 0)
+        proc.rows = [Row(0, "code", "")]
+        self.procedures.append(proc)
+        self._orig_kinds[name] = ["code"]
 
     def set_procedure_text(self, proc_name: str, text: str):
         lines = text.split("\n")
