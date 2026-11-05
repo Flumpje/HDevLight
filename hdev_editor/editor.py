@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 _GUTTER_BG = QColor("#F0F0F0")
 _GUTTER_FG = QColor("#888888")
 _CURRENT_LINE_BG = QColor("#FFFFD0")
+_BRACKET_MATCH_BG = QColor("#C5E8FF")
 _EDITOR_BG = QColor("#FFFFFF")
 _EDITOR_FG = QColor("#000000")
 
@@ -172,7 +173,60 @@ class CodeEditor(QPlainTextEdit):
             sel.cursor = self.textCursor()
             sel.cursor.clearSelection()
             selections.append(sel)
+        selections.extend(self._bracket_selections())
         self.setExtraSelections(selections)
+
+    def _bracket_selections(self) -> list:
+        tc = self.textCursor()
+        pos = tc.position()
+        doc = self.document()
+        text = doc.toPlainText()
+
+        # Prefer bracket at cursor, then bracket just before cursor
+        bp = None
+        if pos < len(text) and text[pos] in '()':
+            bp = pos
+        elif pos > 0 and text[pos - 1] in '()':
+            bp = pos - 1
+
+        if bp is None:
+            return []
+
+        mp = self._find_matching_bracket(text, bp)
+        if mp is None:
+            return []
+
+        result = []
+        for p in (bp, mp):
+            sel = QTextEdit.ExtraSelection()
+            sel.format.setBackground(_BRACKET_MATCH_BG)
+            sel.cursor = QTextCursor(doc)
+            sel.cursor.setPosition(p)
+            sel.cursor.movePosition(
+                QTextCursor.MoveOperation.NextCharacter,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            result.append(sel)
+        return result
+
+    def _find_matching_bracket(self, text: str, pos: int) -> int | None:
+        ch = text[pos]
+        if ch == '(':
+            step, open_ch, close_ch = 1, '(', ')'
+        else:
+            step, open_ch, close_ch = -1, ')', '('
+        depth = 1
+        i = pos + step
+        while 0 <= i < len(text):
+            c = text[i]
+            if c == open_ch:
+                depth += 1
+            elif c == close_ch:
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += step
+        return None
 
     # ------------------------------------------------------------------
     # Keyboard handling
