@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.spec.bak
+
+# PyInstaller output
+dist/
+build/
+
+# Cache
+hdev_editor/signature_cache.json
+
+# Sample / test files
+CartonFRMT1_008.hdev
+
+# OS
+.DS_Store
+Thumbs.db
